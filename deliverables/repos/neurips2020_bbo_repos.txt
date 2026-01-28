@@ -1,0 +1,14 @@
+# NeurIPS 2020 BBO winning solutions (as found)
+# Huawei (1st place): HEBO
+https://github.com/huawei-noah/HEBO
+
+# NVIDIA (2nd place): RAPIDS-AI BBO 2nd place solution
+https://github.com/daxiongshu/rapids-ai-BBO-2nd-place-solution
+
+# JetBrains (3rd place): public repo not found; paper reference
+# https://proceedings.mlr.press/v133/sazanovich21a.html
+
+# Ruth Misener (Imperial College London) - Cog Imperial GitHub
+https://github.com/cog-imperial
+# Example repo: OMLT
+https://github.com/cog-imperial/OMLT

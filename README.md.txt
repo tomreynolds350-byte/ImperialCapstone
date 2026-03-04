@@ -1,49 +1,43 @@
-# Imperial Capstone - Bayesian Optimisation (Stage 2)
+﻿# Imperial Capstone - Bayesian Optimisation (Stage 2)
 
 ## Overview
-This repository tracks my weekly Bayesian-optimisation-style submissions for eight black-box functions (2D through 8D). The workflow is intentionally lightweight and explainable: I append each round's observed inputs/outputs to the existing dataset, then propose one new candidate per function using a simple surrogate-guided heuristic. The aim is steady learning and iterative improvement rather than immediate optimality.
+This repository tracks weekly submissions for eight black-box functions (2D to 8D). The workflow is append-only and reproducible:
+- ingest the latest portal feedback,
+- update `initial_data/function_*/initial_inputs.npy` and `initial_outputs.npy`,
+- generate one new query per function,
+- export portal-ready strings and reflection notes.
 
-## Data Layout
-- `initial_data/function_*/initial_inputs.npy` and `initial_data/function_*/initial_outputs.npy` now include the initial samples plus Round 01 (appended).
-- Backup copies of the original initial-only datasets are preserved as `initial_data/function_*/initial_inputs_round00.npy` and `initial_data/function_*/initial_outputs_round00.npy`.
-- Round-level submissions live in `deliverables/submissions/`, including portal-ready strings and raw vectors.
-- Reflections are in `deliverables/reflections/`.
+## Current Strategy Baseline (as of Round 4)
+Default policy is now exploration-heavy for this stage:
+- UCB-first acquisition with configurable `kappa`.
+- Strong novelty weighting and novelty-floor filtering.
+- Large global candidate pools with reduced local clustering around incumbents.
+- Hybrid surrogate stack: GP + MLP + logistic/SVM boundary models.
 
-## Current Round 2 Approach (Summary)
-I moved from pure distance-based exploration (Round 1) to a true Gaussian process (GP) surrogate for Round 2:
-- Fit a GP with a Matern kernel per function (scikit-learn).
-- Tune kernel hyperparameters via a small randomized search (as in the shared repo examples).
-- Choose the acquisition per function (EI vs UCB) based on whether the best observed output is a clear outlier (z-score >= 2.5).
-- Generate candidate points from two sources:
-  1. Global random samples in [0.001, 0.98].
-  2. Local perturbations around the current best point.
-- Score candidates using EI or UCB (selected per function), then apply a soft boundary penalty (0.05 margin) to avoid extreme 0.00/0.98 corners.
+This is implemented in:
+- `execution/propose_round_04_candidates.py`
 
-Round 2 acquisition choices:
-- EI: Functions 5 and 7
-- UCB: Functions 1, 2, 3, 4, 6, 8
-- Select the highest-EI candidate and format it for portal submission.
+## Key Data and Deliverables
+- Data store: `initial_data/function_*/initial_inputs.npy`, `initial_outputs.npy`
+- Submissions: `deliverables/submissions/`
+- Reflections: `deliverables/reflections/`
+- Notes/work logs: `deliverables/notes/`
 
-This gives a principled trade-off between exploration (uncertainty) and exploitation (predicted improvement), while staying consistent with the tutor advice to remain exploration-heavy until mid-stage.
+## Round 4 Canonical Files
+- Portal strings: `deliverables/submissions/round_04_portal_strings.txt`
+- Raw vectors: `deliverables/submissions/round_04_portal_strings.json`
+- Input arrays: `deliverables/submissions/round_04_inputs.txt`
+- Diagnostics: `deliverables/submissions/round_04_hybrid_debug.json`
+- Part 2 reflection: `deliverables/reflections/round_04_reflection.md`
+- Work log: `deliverables/notes/round_04_work_log.md`
 
-## Key Files for Round 2
-- Portal strings: `deliverables/submissions/round_02_portal_strings.txt`
-- Raw vectors: `deliverables/submissions/round_02_portal_strings.json`
-- Round 2 inputs list: `deliverables/submissions/round_02_inputs.txt`
-- Reflection (Part 1 + Part 2): `deliverables/reflections/round_02_reflection.md`
+## Script Usage
+Generate canonical Round 4 outputs (without re-ingesting data):
+- `python execution/propose_round_04_candidates.py --strategy explore --prefix round_04 --skip-ingest`
 
-## Helpful Scripts
-- `execution/summarize_initial_data.py` - summarises current data for all functions.
-- `execution/plot_round_comparison.py` - compares pre/post round distributions (if run).
-- `execution/propose_gp_candidates.py` - GP + EI candidate generation for the next round.
-
-## Reference Repos (shared by Murari)
-- https://github.com/jdchen5/machinelearninglabs
-- https://github.com/jdchen5/machinelearninglabs/blob/main/CCompetition/old_codes/function_1.ipynb
+Generate an alternate-prefixed set:
+- `python execution/propose_round_04_candidates.py --strategy explore --prefix round_04_explore --skip-ingest`
 
 ## Portal Format Reminder
-Each function input is a hyphen-separated string with six decimals per component, e.g.:
-- Function 1: `x1-x2`
-- Function 8: `x1-x2-x3-x4-x5-x6-x7-x8`
-
-All values must be in `[0, 1)` and formatted to exactly six decimals.
+Each function input must be a hyphen-separated string with six decimals per component and values in `[0, 1)`.
+Example: `0.123456-0.654321`.

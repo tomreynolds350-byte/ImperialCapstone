@@ -1,58 +1,51 @@
-# Stage 2 High-Level Directive
+﻿# Stage 2 High-Level Directive
 
 Goal
-- Maximize eight unknown black-box functions using limited evaluations.
-- Propose exactly one new input per function per round and produce a short reflection.
+- Maximize eight unknown black-box functions under strict evaluation limits.
+- Propose exactly one new input per function per round and produce reflection-ready evidence.
 
 When to Use
-- At the start of Stage 2 to set expectations and constraints.
-- When the user asks for the overall process, rules, or a reset of strategy.
+- At the start of each weekly round.
+- When resetting strategy after new portal feedback.
 
 Inputs
-- Initial data: 10 (x, y) points per function.
-- Round number and any new outputs from the portal.
-- Downloaded portal feedback for the most recent round (often delivered via email and/or as a downloadable file; may be a NumPy binary).
-- Any user constraints (time, preferred methods, reporting format).
-- Portal submission format requirements, if provided.
+- Current datasets per function (`initial_data/function_*/initial_inputs.npy`, `initial_outputs.npy`).
+- Latest portal feedback files (inputs/outputs export).
+- Round number and user preference (currently: exploration-heavy).
 
 Outputs
-- Eight candidate inputs (one per function) for the next round.
-- Portal-ready strings (hyphen-separated, six decimals per component).
-- A brief reflection covering method, exploration vs exploitation, what was learned, and next steps.
+- Eight candidate inputs (one per function).
+- Portal-ready strings (hyphen-separated, six decimals).
+- Reflection-ready evidence (support vectors, gradients, model trade-offs, next-step rationale).
 
 Process
-1. Download portal feedback and append the new (x, y) row to each function's dataset.
-2. Review all available data per function (initial + prior rounds).
-3. Identify the current best y and its x for each function.
-4. Pick a strategy per function (explore, exploit, or balance) based on dimension and data density.
-5. Propose one new x per function (manually adjust if needed for sanity/bounds).
-6. Validate format and bounds; produce portal-ready strings.
-7. Write the reflection tied to decisions and evidence.
+1. Parse latest portal exports and append one `(x, y)` row per function (unless explicitly skipped).
+2. Recompute per-function state: incumbent best, spread, uncertainty, and density.
+3. Generate candidates with hybrid surrogates (GP + MLP + logistic/SVM boundary models).
+4. Score candidates with exploration-heavy policy:
+   - UCB-focused acquisition,
+   - novelty weighting,
+   - novelty-floor filtering,
+   - boundary sanity checks.
+5. Select one in-bounds candidate per function.
+6. Write `round_XX_*` submission artifacts and reflection notes.
+
+Current Strategy Directive (Active)
+- Default to exploration-heavy unless the user asks otherwise.
+- Prefer broader state-space coverage over short-term local gain.
+- Keep exploitation constrained until later rounds.
 
 Constraints and Scope
 - One query per function per round.
-- Functions are unknown and increase in dimension from 2D to 8D.
-- Evaluations are limited; focus on smart, evidence-based guesses.
-- Use any ML method (random, grid, Bayesian optimization, manual reasoning, surrogate models).
-- Perfection is not required; the goal is a thoughtful iterative process.
-- Stage 2 runs from Module 2 through Module 24; Module 25 is for final tuning and optional sharing.
-
-Not Required
-- Building a full optimizer from scratch.
-- Submitting code as part of the portal.
-- Finding the global maximum for every function.
+- Dimensions: 2D, 2D, 3D, 4D, 4D, 5D, 6D, 8D.
+- Outputs may be noisy; avoid overfitting to single-point jumps.
+- Keep all portal values in `[0, 1)` with six-decimal formatting.
 
 Edge Cases
-- Missing or incomplete round data: ask for clarification before proposing.
-- Dimension mismatch: verify expected dimension per function before formatting.
-- Noise is expected (outputs include random noise): avoid overreacting to a single point; note it in reflection and hedge with exploration.
-- Same input may return a slightly different output: treat y as noisy and focus on trends over rounds.
-- Portal format rejection: revalidate precision and separator rules.
-
-Notes
-- Reflections should document method choice, exploration vs exploitation, and what the last result taught you.
-- Capstone "success" is completing the iterative submit -> feedback -> append -> resubmit loop each round; optimality is not required.
-- Keep a clear, repeatable weekly workflow for consistency.
+- Missing/incomplete round files: stop and request correct files.
+- Duplicate input with mismatched output: do not append; flag data integrity issue.
+- Dimension mismatch: fail fast and inspect function-specific files.
+- Formatting rejection by portal: revalidate token count and decimal formatting.
 
 Change History
 
@@ -60,7 +53,8 @@ Change History
 | --- | --- | --- |
 | 1.0.0 | January 28, 2026 | Initial directive created |
 | 1.0.1 | January 28, 2026 | Added change history section |
-| 1.0.2 | February 2, 2026 | Clarified portal feedback loop, manual adjustment, and expected noise |
+| 1.0.2 | February 2, 2026 | Clarified portal feedback loop and noise handling |
+| 1.1.0 | February 18, 2026 | Set exploration-heavy policy as active default; added hybrid-surrogate and novelty-floor process |
 
-Last Updated: February 2, 2026
+Last Updated: February 18, 2026
 Status: Active

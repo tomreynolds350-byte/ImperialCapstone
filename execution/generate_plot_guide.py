@@ -38,13 +38,23 @@ def main() -> None:
         default=str(Path("deliverables") / "notes" / "round_01_plot_guide.md"),
         help="Output markdown path",
     )
+    parser.add_argument(
+        "--title",
+        default="Round 01 Plot Guide (Internal)",
+        help="Top-level markdown title",
+    )
+    parser.add_argument(
+        "--plots-rel-root",
+        default="plots",
+        help="Path prefix used in the 'Plots to review' bullet",
+    )
     args = parser.parse_args()
 
     out_path = Path(args.out_path)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
     lines: List[str] = []
-    lines.append("# Round 01 Plot Guide (Internal)")
+    lines.append(f"# {args.title}")
     lines.append("")
     lines.append("This is an internal, novice-friendly guide to explain what the PCA and scatter plots show for each function.")
     lines.append("It stays descriptive: ranges, variance structure, and which dimensions are most associated with y in the current data.")
@@ -85,9 +95,9 @@ def main() -> None:
         )
         lines.append(
             "- Plots to review: "
-            f"plots/function_{function_id}/scatter_x1_x2.png, "
-            f"plots/function_{function_id}/dim_vs_y.png, "
-            f"plots/function_{function_id}/pca_2d.png"
+            f"{args.plots_rel_root}/function_{function_id}/scatter_x1_x2.png, "
+            f"{args.plots_rel_root}/function_{function_id}/dim_vs_y.png, "
+            f"{args.plots_rel_root}/function_{function_id}/pca_2d.png"
         )
         lines.append("")
         lines.append("Suggested talking points:")

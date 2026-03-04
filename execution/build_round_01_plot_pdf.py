@@ -1,4 +1,4 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import argparse
 from pathlib import Path
@@ -59,25 +59,27 @@ def _plot_side_by_side(
     title: str,
     function_id: int,
     pdf: PdfPages,
+    pre_label: str,
+    post_label: str,
 ) -> None:
     pre_img = _load_image(pre_path)
     post_img = _load_image(post_path)
 
     fig, axes = plt.subplots(1, 2, figsize=(11, 6.5))
     axes[0].imshow(pre_img)
-    axes[0].set_title("Pre (initial data)")
+    axes[0].set_title(pre_label)
     axes[0].axis("off")
     axes[1].imshow(post_img)
-    axes[1].set_title("Post (initial + round 01)")
+    axes[1].set_title(post_label)
     axes[1].axis("off")
-    fig.suptitle(f"Function {function_id} — {title}", fontsize=14)
+    fig.suptitle(f"Function {function_id} - {title}", fontsize=14)
     fig.tight_layout()
     pdf.savefig(fig)
     plt.close(fig)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build a pre/post round 01 plot PDF.")
+    parser = argparse.ArgumentParser(description="Build a pre/post comparison plot PDF.")
     parser.add_argument(
         "--plots-root",
         default=str(Path("deliverables") / "round_01" / "plots"),
@@ -93,6 +95,16 @@ def main() -> None:
         action="append",
         help="Custom panel in format function_id|filename|optional_title (can repeat)",
     )
+    parser.add_argument(
+        "--pre-label",
+        default="Pre (initial data)",
+        help="Label for left-side image",
+    )
+    parser.add_argument(
+        "--post-label",
+        default="Post (initial + round 01)",
+        help="Label for right-side image",
+    )
     args = parser.parse_args()
 
     plots_root = Path(args.plots_root)
@@ -105,7 +117,15 @@ def main() -> None:
         for function_id, filename, title in panels:
             pre_path = plots_root / "pre" / f"function_{function_id}" / filename
             post_path = plots_root / "post" / f"function_{function_id}" / filename
-            _plot_side_by_side(pre_path, post_path, title, function_id, pdf)
+            _plot_side_by_side(
+                pre_path,
+                post_path,
+                title,
+                function_id,
+                pdf,
+                pre_label=args.pre_label,
+                post_label=args.post_label,
+            )
 
 
 if __name__ == "__main__":

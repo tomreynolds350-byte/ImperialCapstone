@@ -7,14 +7,14 @@ from bo_core import build_round_candidate_parser, run_round_candidate_script
 
 def main() -> None:
     parser = build_round_candidate_parser(
-        description="Ingest latest round outputs and propose Round 06 candidates (GP + NN hybrid).",
+        description="Ingest latest round outputs and propose Round 07 candidates (GP + NN hybrid).",
         inputs_default=Path(r"c:\Users\tom_m\Downloads\inputs.txt"),
         outputs_default=Path(r"c:\Users\tom_m\Downloads\outputs.txt"),
-        seed_default=20260226,
-        prefix_default="round_06",
+        seed_default=20260319,
+        prefix_default="round_07",
     )
     args = parser.parse_args()
-    run_round_candidate_script(args, snapshot_filename="round_05_outputs_canonical.txt")
+    run_round_candidate_script(args, snapshot_filename="round_06_outputs_canonical.txt")
 
 
 if __name__ == "__main__":

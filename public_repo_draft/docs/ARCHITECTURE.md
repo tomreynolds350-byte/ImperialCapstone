@@ -18,7 +18,8 @@
   - `initial_data/function_*/initial_inputs.npy`
   - `initial_data/function_*/initial_outputs.npy`
 - Modeling/orchestration layer:
-  - `execution/propose_round_06_candidates.py` (current default round workflow)
+  - `execution/bo_core.py` (shared BO core: ingestion, GP fitting, scoring, refinement, artifact writing)
+  - `execution/propose_round_06_candidates.py` (current default round workflow wrapper)
 - Artifact/output layer:
   - `deliverables/submissions/round_XX_inputs.txt`
   - `deliverables/submissions/round_XX_portal_strings.txt`
@@ -30,8 +31,9 @@
 ## 4) Modeling stack
 - Gaussian Process Regressor:
   - Provides mean + uncertainty for acquisition scoring.
+  - Uses an anisotropic Matern kernel with direct optimizer restarts and diagnostics-first fit reporting.
 - MLP Regressor:
-  - Captures nonlinear response patterns and supports gradient-style local refinement.
+  - Captures nonlinear response patterns for shortlist reranking.
 - Logistic Regression + RBF SVM:
   - Classifies high-vs-low response regions and highlights boundary uncertainty.
 
@@ -40,6 +42,7 @@
   - Balanced acquisition mode with reduced UCB pressure.
   - EI enabled where incumbent dominance is strong.
   - Novelty retained as guardrail, but with reduced weight.
+  - GP acquisition selects the shortlist first; hybrid reranking and boundary override decide the final point.
 
 ## 6) Architecture trade-offs
 - Benefits:

@@ -15,7 +15,13 @@ Default policy is now exploration-heavy for this stage:
 - Hybrid surrogate stack: GP + MLP + logistic/SVM boundary models.
 
 This is implemented in:
-- `execution/propose_round_04_candidates.py`
+- `execution/bo_core.py`
+- round wrappers such as `execution/propose_round_06_candidates.py`
+
+Core BO changes:
+- Direct anisotropic Matern GP fitting with optimizer restarts instead of CV-driven kernel search.
+- GP acquisition drives shortlist selection first; auxiliary models rerank that shortlist.
+- Reflected local sampling and boundary-aware final selection reduce exact-boundary pileups.
 
 ## Key Data and Deliverables
 - Data store: `initial_data/function_*/initial_inputs.npy`, `initial_outputs.npy`

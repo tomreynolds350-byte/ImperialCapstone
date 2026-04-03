@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import tempfile
 import uuid
@@ -34,6 +35,8 @@ DEFAULT_LOW = 0.001
 DEFAULT_HIGH = 0.98
 LENGTH_SCALE_BOUNDS = (0.02, 3.0)
 NOISE_LEVEL_BOUNDS = (1e-6, 0.25)
+PORTAL_DECIMALS = 6
+SMOOTHNESS_PROBE_COUNT = 96
 SHORTLIST_SIZE_BY_STRATEGY = {"balanced": 96, "explore": 128, "exploit": 72}
 HYBRID_WEIGHTS = {
     "balanced": {"gp": 0.70, "nn": 0.15, "classification": 0.10, "novelty": 0.05},
@@ -114,15 +117,27 @@ def _standardize(values: np.ndarray) -> np.ndarray:
 
 
 def _format_portal_line(function_id: int, vector: np.ndarray) -> str:
-    return f"function_{function_id}: " + "-".join(f"{float(v):.6f}" for v in vector)
+    return f"function_{function_id}: " + _portal_key(vector)
+
+
+def _portal_key(vector: np.ndarray) -> str:
+    return "-".join(f"{float(v):.{PORTAL_DECIMALS}f}" for v in np.asarray(vector, dtype=float).reshape(-1))
+
+
+def _portal_key_set(points: np.ndarray) -> set[str]:
+    arr = np.asarray(points, dtype=float)
+    if arr.ndim == 1:
+        return {_portal_key(arr)}
+    return {_portal_key(row) for row in arr}
 
 
 def _ensure_writable_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
-    try:
-        path.chmod(0o700)
-    except OSError:
-        pass
+    if os.name != "nt":
+        try:
+            path.chmod(0o700)
+        except OSError:
+            pass
 
 
 def _native_tempdir_is_unwritable() -> bool:
@@ -267,6 +282,76 @@ def upper_confidence_bound(mu: np.ndarray, sigma: np.ndarray, kappa: float) -> n
     return np.asarray(mu, dtype=float) + float(kappa) * np.asarray(sigma, dtype=float)
 
 
+def _top_valid_indices(scores: np.ndarray, valid_mask: np.ndarray, limit: int) -> np.ndarray:
+    if limit <= 0:
+        return np.empty(0, dtype=int)
+    valid_scores = np.where(valid_mask, np.asarray(scores, dtype=float), -np.inf)
+    idx = np.argsort(valid_scores)[-min(limit, len(valid_scores)) :]
+    return idx[np.isfinite(valid_scores[idx])]
+
+
+def _merge_ranked_indices(*index_arrays: np.ndarray) -> np.ndarray:
+    merged: List[int] = []
+    seen: set[int] = set()
+    for arr in index_arrays:
+        for idx in np.asarray(arr, dtype=int)[::-1]:
+            idx_int = int(idx)
+            if idx_int in seen:
+                continue
+            merged.append(idx_int)
+            seen.add(idx_int)
+    return np.asarray(merged, dtype=int)
+
+
+def _diversified_shortlist_indices(
+    primary_score: np.ndarray,
+    alt_score: np.ndarray,
+    uncertainty_score: np.ndarray,
+    valid_mask: np.ndarray,
+    *,
+    shortlist_size: int,
+    acquisition: str,
+    suspicious_gp: bool,
+) -> np.ndarray:
+    primary_full = _top_valid_indices(primary_score, valid_mask, shortlist_size)
+    if acquisition != "ei" or primary_full.size <= 1:
+        return primary_full[::-1]
+
+    if suspicious_gp:
+        primary_count = max(1, int(np.floor(shortlist_size * 0.50)))
+        alt_count = max(1, int(np.floor(shortlist_size * 0.30)))
+    else:
+        primary_count = max(1, int(np.floor(shortlist_size * 0.70)))
+        alt_count = max(1, int(np.floor(shortlist_size * 0.20)))
+    uncertainty_count = max(1, shortlist_size - primary_count - alt_count)
+
+    primary_idx = _top_valid_indices(primary_score, valid_mask, primary_count)
+    alt_idx = _top_valid_indices(alt_score, valid_mask, alt_count)
+    uncertainty_idx = _top_valid_indices(uncertainty_score, valid_mask, uncertainty_count)
+
+    merged = _merge_ranked_indices(primary_idx, alt_idx, uncertainty_idx).tolist()
+    if len(merged) >= shortlist_size:
+        return np.asarray(merged[:shortlist_size], dtype=int)
+
+    seen = set(merged)
+    fill_sources = (
+        primary_full[::-1],
+        _top_valid_indices(alt_score, valid_mask, shortlist_size)[::-1],
+        _top_valid_indices(uncertainty_score, valid_mask, shortlist_size)[::-1],
+    )
+    for source in fill_sources:
+        for idx in np.asarray(source, dtype=int):
+            idx_int = int(idx)
+            if idx_int in seen:
+                continue
+            merged.append(idx_int)
+            seen.add(idx_int)
+            if len(merged) >= shortlist_size:
+                return np.asarray(merged, dtype=int)
+
+    return np.asarray(merged, dtype=int)
+
+
 def _kernel_for_dim(dim: int) -> object:
     return ConstantKernel(1.0, (1e-3, 1e3)) * Matern(
         length_scale=np.full(dim, 0.2, dtype=float),
@@ -307,6 +392,57 @@ def _loo_gp_metrics(x: np.ndarray, y: np.ndarray, fitted_gp: GaussianProcessRegr
     return loo_mae, loo_rmse
 
 
+def _gp_smoothness_metrics(
+    gp: GaussianProcessRegressor,
+    dim: int,
+    *,
+    low: float = DEFAULT_LOW,
+    high: float = DEFAULT_HIGH,
+    probe_count: int = SMOOTHNESS_PROBE_COUNT,
+) -> Dict[str, Any]:
+    span = float(high) - float(low)
+    if span <= 0:
+        raise ValueError("high must be greater than low")
+
+    step = min(max(0.015 * span, 1e-3), 0.025)
+    interior_low = low + step
+    interior_high = high - step
+    if interior_high <= interior_low:
+        interior_low = low
+        interior_high = high
+        step = max(0.25 * span, 1e-3)
+
+    rng = np.random.default_rng(0)
+    base = interior_low + (interior_high - interior_low) * rng.random((probe_count, dim))
+    abs_grad = np.zeros((probe_count, dim), dtype=float)
+
+    for dim_idx in range(dim):
+        plus = base.copy()
+        minus = base.copy()
+        plus[:, dim_idx] += step
+        minus[:, dim_idx] -= step
+        mu_plus = np.asarray(gp.predict(plus), dtype=float)
+        mu_minus = np.asarray(gp.predict(minus), dtype=float)
+        abs_grad[:, dim_idx] = np.abs(mu_plus - mu_minus) / (2.0 * step)
+
+    dim_median = np.median(abs_grad, axis=0)
+    dim_p95 = np.quantile(abs_grad, 0.95, axis=0)
+    dim_spikiness = dim_p95 / np.maximum(dim_median, 1e-9)
+    positive_medians = dim_median[dim_median > 1e-9]
+    anisotropy = float(np.max(dim_median) / max(float(np.min(positive_medians)) if positive_medians.size else 1.0, 1e-9))
+
+    return {
+        "gp_abs_gradient_median": float(np.median(abs_grad)),
+        "gp_abs_gradient_p95": float(np.quantile(abs_grad, 0.95)),
+        "gp_gradient_spikiness": float(np.quantile(abs_grad, 0.95) / max(np.median(abs_grad), 1e-9)),
+        "gp_gradient_anisotropy": anisotropy,
+        "gp_dim_abs_gradient_median": [float(v) for v in dim_median.tolist()],
+        "gp_dim_abs_gradient_p95": [float(v) for v in dim_p95.tolist()],
+        "gp_dim_gradient_spikiness": [float(v) for v in dim_spikiness.tolist()],
+        "smoothness_probe_step": float(step),
+    }
+
+
 def fit_gp_model(
     x: np.ndarray,
     y: np.ndarray,
@@ -336,6 +472,15 @@ def fit_gp_model(
     fitted_length_scales = np.asarray(gp.kernel_.k1.k2.length_scale, dtype=float).reshape(-1)
     lower_hits = np.isclose(fitted_length_scales, LENGTH_SCALE_BOUNDS[0], rtol=0.0, atol=1e-4)
     upper_hits = np.isclose(fitted_length_scales, LENGTH_SCALE_BOUNDS[1], rtol=0.0, atol=1e-4)
+    smoothness = _gp_smoothness_metrics(gp, dim)
+    target_std = float(np.std(y))
+    flat_gradient_floor = max(1e-6, 0.05 * max(target_std, 1e-3) / max(DEFAULT_HIGH - DEFAULT_LOW, 1e-9))
+    gp_flat_warning = bool(target_std > 1e-3 and smoothness["gp_abs_gradient_p95"] < flat_gradient_floor)
+    dim_spikiness = np.asarray(smoothness["gp_dim_gradient_spikiness"], dtype=float)
+    gp_concertina_warning = bool(
+        np.any(dim_spikiness > 12.0)
+        or (np.any(lower_hits) and smoothness["gp_gradient_spikiness"] > 8.0)
+    )
 
     info: Dict[str, Any] = {
         "fit_score_name": "negative_loo_rmse",
@@ -345,7 +490,7 @@ def fit_gp_model(
         "best_length_scales": [float(v) for v in fitted_length_scales.tolist()],
         "best_noise_level": float(gp.kernel_.k2.noise_level),
         "objective_direction": "maximize",
-        "target_std": float(np.std(y)),
+        "target_std": target_std,
         "loo_mae": loo_mae,
         "loo_rmse": loo_rmse,
         "length_scale_at_lower_bound": bool(np.any(lower_hits)),
@@ -354,7 +499,10 @@ def fit_gp_model(
         "length_scale_upper_bound_dims_1_based": [int(i + 1) for i in np.flatnonzero(upper_hits)],
         "n_optimizer_restarts": int(n_restarts_optimizer),
         "gp_fit_fallback": bool(fit_used_fallback),
+        "gp_flat_warning": gp_flat_warning,
+        "gp_concertina_warning": gp_concertina_warning,
     }
+    info.update(smoothness)
     return gp, info
 
 
@@ -485,7 +633,7 @@ def _sample_local_cloud(
     rng: np.random.Generator,
     center: np.ndarray,
     n_samples: int,
-    sigma: float,
+    sigma: np.ndarray | float,
     low: float,
     high: float,
 ) -> np.ndarray:
@@ -509,16 +657,31 @@ def _min_distance_to_dataset(candidates: np.ndarray, x: np.ndarray) -> np.ndarra
     return np.min(np.linalg.norm(diff, axis=2), axis=1)
 
 
+def _local_trust_region_sigma(
+    length_scales: Sequence[float],
+    *,
+    strategy: str,
+) -> np.ndarray:
+    ls = np.asarray(length_scales, dtype=float).reshape(-1)
+    sigma = 0.30 * np.clip(ls, 0.06, 0.45)
+    if strategy == "explore":
+        sigma *= 1.15
+    elif strategy == "exploit":
+        sigma *= 0.80
+    return np.clip(sigma, 0.015, 0.14)
+
+
 def _gp_candidate_pool(
     rng: np.random.Generator,
     best_x: np.ndarray,
     dim: int,
     low: float,
     high: float,
+    local_sigma: np.ndarray | float | None = None,
 ) -> np.ndarray:
     n_global = 5000 if dim <= 4 else 7000 if dim <= 6 else 9000
     n_local = 600 if dim <= 4 else 500 if dim <= 6 else 400
-    sigma_local = 0.08 if dim <= 4 else 0.10 if dim <= 6 else 0.12
+    sigma_local = local_sigma if local_sigma is not None else (0.08 if dim <= 4 else 0.10 if dim <= 6 else 0.12)
 
     global_samples = low + (high - low) * rng.random((n_global, dim))
     local_samples = _sample_local_cloud(rng, best_x, n_local, sigma_local, low, high)
@@ -533,6 +696,7 @@ def _hybrid_candidate_pool(
     low: float,
     high: float,
     strategy: str,
+    local_sigma: np.ndarray | float | None = None,
 ) -> np.ndarray:
     dim = x.shape[1]
     top_k = min(4, len(y))
@@ -553,6 +717,8 @@ def _hybrid_candidate_pool(
         n_local_per_top = 450 if dim <= 4 else 350 if dim <= 6 else 250
         n_support = 200 if support_indices.size > 0 else 0
         sigma_local = 0.06 if dim <= 4 else 0.08 if dim <= 6 else 0.10
+    if local_sigma is not None:
+        sigma_local = local_sigma
 
     global_samples = low + (high - low) * rng.random((n_global, dim))
     parts: List[np.ndarray] = [global_samples]
@@ -628,6 +794,7 @@ def _refine_candidates(
     *,
     strategy: str,
     novelty_floor: float,
+    existing_portal_keys: set[str] | None = None,
     duplicate_tol: float = 1e-5,
 ) -> List[Tuple[np.ndarray, float]]:
     dim = x.shape[1]
@@ -638,11 +805,17 @@ def _refine_candidates(
     elif strategy == "exploit":
         initial_step *= 0.75
 
+    existing_portal_keys = existing_portal_keys or set()
+    seen_portal_keys: set[str] = set(existing_portal_keys)
     results: List[Tuple[np.ndarray, float]] = []
     for point in np.asarray(start_points[:max_points], dtype=float):
+        point_key = _portal_key(point)
+        if point_key in seen_portal_keys:
+            continue
         current = point.copy()
         current_score = float(score_fn(current))
         results.append((current.copy(), current_score))
+        seen_portal_keys.add(point_key)
         step = initial_step
 
         for _ in range(8):
@@ -650,7 +823,10 @@ def _refine_candidates(
             for _ in range(6):
                 delta = rng.normal(0.0, step, size=dim)
                 trial = reflect_to_bounds(current + delta, low, high)
+                trial_key = _portal_key(trial)
                 if float(np.min(np.linalg.norm(x - trial.reshape(1, -1), axis=1))) <= duplicate_tol:
+                    continue
+                if trial_key in seen_portal_keys:
                     continue
                 if strategy == "explore":
                     trial_min_dist = float(np.min(np.linalg.norm(x - trial.reshape(1, -1), axis=1)))
@@ -667,12 +843,50 @@ def _refine_candidates(
                 current = np.asarray(best_point, dtype=float)
                 current_score = float(best_score)
                 results.append((current.copy(), current_score))
+                seen_portal_keys.add(_portal_key(current))
             else:
                 step *= 0.5
                 if step < 0.004:
                     break
 
     return results
+
+
+def _select_final_candidate(
+    candidates_with_scores: List[Tuple[np.ndarray, float]],
+    x: np.ndarray,
+    low: float,
+    high: float,
+    boundary_margin: float,
+) -> Tuple[np.ndarray, float, bool, int, bool]:
+    if not candidates_with_scores:
+        raise ValueError("No candidates available for final selection")
+
+    existing_portal_keys = _portal_key_set(x)
+    unique_candidates: Dict[str, Tuple[np.ndarray, float]] = {}
+    filtered_existing = 0
+
+    for point, score in candidates_with_scores:
+        point_arr = np.asarray(point, dtype=float)
+        point_key = _portal_key(point_arr)
+        if point_key in existing_portal_keys:
+            filtered_existing += 1
+            continue
+        previous = unique_candidates.get(point_key)
+        if previous is None or float(score) > previous[1]:
+            unique_candidates[point_key] = (point_arr, float(score))
+
+    if unique_candidates:
+        chosen, chosen_score, boundary_override_used = _boundary_override(
+            list(unique_candidates.values()),
+            low,
+            high,
+            boundary_margin,
+        )
+        return chosen, chosen_score, boundary_override_used, filtered_existing, False
+
+    chosen, chosen_score, boundary_override_used = _boundary_override(candidates_with_scores, low, high, boundary_margin)
+    return chosen, chosen_score, boundary_override_used, filtered_existing, True
 
 
 def _boundary_override(
@@ -735,11 +949,14 @@ def choose_gp_candidate(
         random_state=int(rng.integers(0, 1_000_000)),
         n_restarts_optimizer=gp_restarts,
     )
+    local_sigma = _local_trust_region_sigma(gp_info["best_length_scales"], strategy="balanced")
+    existing_portal_keys = _portal_key_set(x)
 
-    candidates = _gp_candidate_pool(rng, best_x, dim, low, high)
+    candidates = _gp_candidate_pool(rng, best_x, dim, low, high, local_sigma=local_sigma)
     min_dist = _min_distance_to_dataset(candidates, x)
     bound_dist = _boundary_distance(candidates, low, high)
     boundary_weight = _boundary_weight(bound_dist, boundary_margin, floor=0.20)
+    portal_duplicate_mask = np.array([_portal_key(point) in existing_portal_keys for point in candidates], dtype=bool)
 
     mu, sigma = gp.predict(candidates, return_std=True)
     xi = 0.01 * float(np.std(y)) if float(np.std(y)) > 0 else 0.0
@@ -747,16 +964,32 @@ def choose_gp_candidate(
     ucb = upper_confidence_bound(mu, sigma, kappa=kappa)
     gp_primary = ei if acquisition == "ei" else ucb
 
-    valid_mask = min_dist > 1e-5
+    valid_mask = (min_dist > 1e-5) & ~portal_duplicate_mask
     shortlist_score = gp_primary * boundary_weight
-    valid_scores = np.where(valid_mask, shortlist_score, -np.inf)
+    alt_shortlist_score = ucb * boundary_weight
+    uncertainty_shortlist_score = sigma * boundary_weight
     shortlist_size = min(64, len(candidates))
-    shortlist_idx = np.argsort(valid_scores)[-shortlist_size:]
-    shortlist_idx = shortlist_idx[np.isfinite(valid_scores[shortlist_idx])]
+    suspicious_gp = bool(
+        gp_info["length_scale_at_lower_bound"]
+        or gp_info["length_scale_at_upper_bound"]
+        or gp_info["gp_flat_warning"]
+        or gp_info["gp_concertina_warning"]
+    )
+    shortlist_idx = _diversified_shortlist_indices(
+        shortlist_score,
+        alt_shortlist_score,
+        uncertainty_shortlist_score,
+        valid_mask,
+        shortlist_size=shortlist_size,
+        acquisition=acquisition,
+        suspicious_gp=suspicious_gp,
+    )
     if shortlist_idx.size == 0:
-        shortlist_idx = np.array([int(np.argmax(shortlist_score))], dtype=int)
+        nonduplicate_scores = np.where(~portal_duplicate_mask, shortlist_score, -np.inf)
+        fallback_idx = int(np.argmax(nonduplicate_scores)) if np.any(np.isfinite(nonduplicate_scores)) else int(np.argmax(shortlist_score))
+        shortlist_idx = np.array([fallback_idx], dtype=int)
 
-    start_points = candidates[shortlist_idx[::-1]]
+    start_points = candidates[shortlist_idx]
 
     def score_fn(point: np.ndarray) -> float:
         point_2d = np.asarray(point, dtype=float).reshape(1, -1)
@@ -776,11 +1009,20 @@ def choose_gp_candidate(
         high,
         strategy="balanced",
         novelty_floor=0.0,
+        existing_portal_keys=existing_portal_keys,
     )
     for point in start_points:
-        refined.append((np.asarray(point, dtype=float), float(score_fn(point))))
+        point_arr = np.asarray(point, dtype=float)
+        if _portal_key(point_arr) not in existing_portal_keys:
+            refined.append((point_arr, float(score_fn(point_arr))))
 
-    chosen, chosen_score, boundary_override_used = _boundary_override(refined, low, high, boundary_margin)
+    chosen, chosen_score, boundary_override_used, portal_duplicate_candidates_filtered, portal_duplicate_guard_fallback = _select_final_candidate(
+        refined,
+        x,
+        low,
+        high,
+        boundary_margin,
+    )
     chosen_min_dist = float(np.min(np.linalg.norm(x - chosen.reshape(1, -1), axis=1)))
     chosen_bound_dist = float(_boundary_distance(chosen.reshape(1, -1), low, high)[0])
     chosen_mu, chosen_sigma = gp.predict(chosen.reshape(1, -1), return_std=True)
@@ -805,6 +1047,11 @@ def choose_gp_candidate(
         "chosen_candidate_bound_dist": chosen_bound_dist,
         "boundary_override_used": bool(boundary_override_used),
         "ucb_kappa": float(kappa),
+        "portal_duplicate_candidates_filtered": int(portal_duplicate_candidates_filtered),
+        "portal_duplicate_guard_fallback": bool(portal_duplicate_guard_fallback),
+        "chosen_candidate_portal_key": _portal_key(chosen),
+        "chosen_candidate_matches_existing_portal": bool(_portal_key(chosen) in existing_portal_keys),
+        "shortlist_diversified_for_ei": bool(acquisition == "ei"),
     }
     info.update(gp_info)
     return chosen, info
@@ -840,9 +1087,11 @@ def choose_hybrid_candidate(
         random_state=seed + 17,
         n_restarts_optimizer=gp_restarts,
     )
+    local_sigma = _local_trust_region_sigma(gp_info["best_length_scales"], strategy=strategy)
     mlp = _fit_mlp_regressor(x, y, seed=seed + dim)
     logistic, svc, labels, cls_threshold = _fit_classifiers(x, y, seed=seed + 100 + dim)
     regression_metrics = _evaluate_regression_models(x, y, seed=seed + 200 + dim)
+    existing_portal_keys = _portal_key_set(x)
 
     svc_model = svc.named_steps["svc"]
     train_decision = np.asarray(svc.decision_function(x), dtype=float)
@@ -862,6 +1111,7 @@ def choose_hybrid_candidate(
         low=low,
         high=high,
         strategy=strategy,
+        local_sigma=local_sigma,
     )
 
     mu, sigma = gp.predict(candidates, return_std=True)
@@ -880,23 +1130,40 @@ def choose_hybrid_candidate(
     min_dist = _min_distance_to_dataset(candidates, x)
     min_bound_dist = _boundary_distance(candidates, low, high)
     boundary_weight = _boundary_weight(min_bound_dist, boundary_margin, floor=0.25)
+    portal_duplicate_mask = np.array([_portal_key(point) in existing_portal_keys for point in candidates], dtype=bool)
 
-    valid_mask = min_dist > 1e-5
+    valid_mask = (min_dist > 1e-5) & ~portal_duplicate_mask
     novelty_floor = 0.0
     if strategy == "explore":
         novelty_floor = float(np.quantile(min_dist, 0.65))
         valid_mask = valid_mask & (min_dist >= novelty_floor)
         if not np.any(valid_mask):
             novelty_floor = float(np.quantile(min_dist, 0.50))
-            valid_mask = min_dist >= novelty_floor
+            valid_mask = (~portal_duplicate_mask) & (min_dist >= novelty_floor)
 
     gp_shortlist_score = gp_primary * boundary_weight
-    valid_gp_scores = np.where(valid_mask, gp_shortlist_score, -np.inf)
+    ucb_shortlist_score = ucb * boundary_weight
+    uncertainty_shortlist_score = sigma * boundary_weight
     shortlist_size = min(SHORTLIST_SIZE_BY_STRATEGY[strategy], len(candidates))
-    shortlist_idx = np.argsort(valid_gp_scores)[-shortlist_size:]
-    shortlist_idx = shortlist_idx[np.isfinite(valid_gp_scores[shortlist_idx])]
+    suspicious_gp = bool(
+        gp_info["length_scale_at_lower_bound"]
+        or gp_info["length_scale_at_upper_bound"]
+        or gp_info["gp_flat_warning"]
+        or gp_info["gp_concertina_warning"]
+    )
+    shortlist_idx = _diversified_shortlist_indices(
+        gp_shortlist_score,
+        ucb_shortlist_score,
+        uncertainty_shortlist_score,
+        valid_mask,
+        shortlist_size=shortlist_size,
+        acquisition=acquisition,
+        suspicious_gp=suspicious_gp,
+    )
     if shortlist_idx.size == 0:
-        shortlist_idx = np.array([int(np.argmax(gp_shortlist_score))], dtype=int)
+        nonduplicate_scores = np.where(~portal_duplicate_mask, gp_shortlist_score, -np.inf)
+        fallback_idx = int(np.argmax(nonduplicate_scores)) if np.any(np.isfinite(nonduplicate_scores)) else int(np.argmax(gp_shortlist_score))
+        shortlist_idx = np.array([fallback_idx], dtype=int)
 
     short_candidates = candidates[shortlist_idx]
     short_gp = gp_primary[shortlist_idx]
@@ -958,11 +1225,20 @@ def choose_hybrid_candidate(
         high,
         strategy=strategy,
         novelty_floor=novelty_floor,
+        existing_portal_keys=existing_portal_keys,
     )
     for point in start_points:
-        refined.append((np.asarray(point, dtype=float), float(total_score_single(point))))
+        point_arr = np.asarray(point, dtype=float)
+        if _portal_key(point_arr) not in existing_portal_keys:
+            refined.append((point_arr, float(total_score_single(point_arr))))
 
-    chosen, chosen_score, boundary_override_used = _boundary_override(refined, low, high, boundary_margin)
+    chosen, chosen_score, boundary_override_used, portal_duplicate_candidates_filtered, portal_duplicate_guard_fallback = _select_final_candidate(
+        refined,
+        x,
+        low,
+        high,
+        boundary_margin,
+    )
     chosen_min_dist = float(np.min(np.linalg.norm(x - chosen.reshape(1, -1), axis=1)))
     chosen_bound_dist = float(_boundary_distance(chosen.reshape(1, -1), low, high)[0])
     chosen_mu, chosen_sigma = gp.predict(chosen.reshape(1, -1), return_std=True)
@@ -1013,6 +1289,11 @@ def choose_hybrid_candidate(
         "weights": dict(weights),
         "novelty_floor_applied": float(novelty_floor),
         "boundary_override_used": bool(boundary_override_used),
+        "portal_duplicate_candidates_filtered": int(portal_duplicate_candidates_filtered),
+        "portal_duplicate_guard_fallback": bool(portal_duplicate_guard_fallback),
+        "chosen_candidate_portal_key": _portal_key(chosen),
+        "chosen_candidate_matches_existing_portal": bool(_portal_key(chosen) in existing_portal_keys),
+        "shortlist_diversified_for_ei": bool(acquisition == "ei"),
     }
     info.update(gp_info)
     info.update(regression_metrics)
@@ -1185,7 +1466,7 @@ def run_gp_candidate_script(args: argparse.Namespace) -> None:
         )
         func_key = f"function_{func_id}"
         raw_vectors[func_key] = [float(v) for v in candidate.tolist()]
-        portal_strings[func_key] = "-".join(f"{float(v):.6f}" for v in candidate)
+        portal_strings[func_key] = _portal_key(candidate)
         debug_info[func_key] = info
 
     write_submission_outputs(
@@ -1261,7 +1542,7 @@ def run_round_candidate_script(
             z_best_threshold=args.z_best_threshold,
         )
         raw_vectors[func_key] = [float(v) for v in candidate.tolist()]
-        portal_strings[func_key] = "-".join(f"{float(v):.6f}" for v in candidate)
+        portal_strings[func_key] = _portal_key(candidate)
         debug_info[func_key] = info
 
     write_submission_outputs(
